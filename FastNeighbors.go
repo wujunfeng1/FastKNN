@@ -24,6 +24,7 @@ type KDLeaf struct {
 type KDTree struct {
 	BoundingBox []Interval
 	DivisionDim int
+	NumPoints   int
 	LSubTree    *KDTree
 	RSubTree    *KDTree
 	LLeaf       *KDLeaf
@@ -50,36 +51,27 @@ func computeBoundingBox(points []Point) []Interval {
 	return boundingBox
 }
 
-func copyPoints(points []Point) []Point {
-	n := len(points)
-	copiedPoints := make([]Point, n)
-	for j := 0; j < n; j++ {
-		copiedPoints[j] = points[j]
-	}
-	return copiedPoints
-}
-
-func NewKDLeaf(points []Point) *KDLeaf {
+func newKDLeaf(points []Point) *KDLeaf {
 	return &KDLeaf{
 		BoundingBox: computeBoundingBox(points),
-		Points:      copyPoints(points),
+		Points:      points,
 	}
 }
 
-func NewKDTree(points []Point, numPointsPerLeaf int) *KDTree {
+func NewKDTree(pointLocations [][]float64, numPointsPerLeaf int) *KDTree {
 	// get dims of data
-	n := len(points)
+	n := len(pointLocations)
 	if n == 0 {
 		log.Fatalln("no input points passed to NewKDTree")
 	}
-	m := len(points[0].Vec)
+	m := len(pointLocations[0])
 	if m == 0 {
 		log.Fatalln("input point of 0 dims is not allowed")
 	}
 
 	// check data
 	for j := 1; j < n; j++ {
-		if len(points[j].Vec) != m {
+		if len(pointLocations[j]) != m {
 			log.Fatalln("dims of input points don't match")
 		}
 	}
@@ -89,22 +81,44 @@ func NewKDTree(points []Point, numPointsPerLeaf int) *KDTree {
 		log.Fatalln("numPointsPerLeaf is not allowed to be < 1")
 	}
 
-	// return a KD tree with all these points in one leaf
+	// create points
+	points := make([]Point, n)
+	for j, location := range pointLocations {
+		points[j] = Point{ID: j, Vec: location}
+	}
+
+	// return a KD tree containing these points
+	return createKDTree(points, numPointsPerLeaf)
+}
+
+func createKDTree(points []Point, numPointsPerLeaf int) *KDTree {
+	// create a KD tree with all these points in one leaf
 	result := &KDTree{
 		BoundingBox: computeBoundingBox(points),
 		DivisionDim: -1,
+		NumPoints:   len(points),
 		LSubTree:    nil,
 		RSubTree:    nil,
-		LLeaf:       NewKDLeaf(points),
+		LLeaf:       newKDLeaf(points),
 		RLeaf:       nil,
 	}
+
+	// split it to satisfy the numPointsPerLeaf condition
 	result.split(numPointsPerLeaf)
+
+	// retur the result
 	return result
 }
 
 func (kdtree *KDTree) split(numPointsPerLeaf int) {
 	if kdtree.DivisionDim != -1 {
 		log.Fatalln("a KDTree is not allowed to split twice")
+	}
+
+	// if the tree is already small, just set its DivisionDim and return
+	if len(kdtree.LLeaf.Points) <= numPointsPerLeaf {
+		kdtree.DivisionDim = 0
+		return
 	}
 
 	// find the dim with the largest variance
@@ -145,23 +159,22 @@ func (kdtree *KDTree) split(numPointsPerLeaf int) {
 	rightPoints := points[n/2 : n]
 	kdtree.LLeaf = nil
 
-	// for each part, split it if it is too large
+	// for each part, split it if it is still too large
 	var waitGroup sync.WaitGroup
 	waitGroup.Add(1)
-
 	go func(wg *sync.WaitGroup) {
 		if len(rightPoints) > numPointsPerLeaf {
-			kdtree.RSubTree = NewKDTree(rightPoints, numPointsPerLeaf)
+			kdtree.RSubTree = createKDTree(rightPoints, numPointsPerLeaf)
 		} else {
-			kdtree.RLeaf = NewKDLeaf(rightPoints)
+			kdtree.RLeaf = newKDLeaf(rightPoints)
 		}
 		wg.Done()
 	}(&waitGroup)
 
 	if len(leftPoints) > numPointsPerLeaf {
-		kdtree.LSubTree = NewKDTree(leftPoints, numPointsPerLeaf)
+		kdtree.LSubTree = createKDTree(leftPoints, numPointsPerLeaf)
 	} else {
-		kdtree.LLeaf = NewKDLeaf(leftPoints)
+		kdtree.LLeaf = newKDLeaf(leftPoints)
 	}
 	waitGroup.Wait()
 }
@@ -198,7 +211,7 @@ func computeDistanceToPoint(center []float64, point []float64) float64 {
 	return result
 }
 
-func (kdtree *KDTree) FindNeighbors(center []float64, radius float64) []Point {
+func (kdtree KDTree) FindNeighbors(center []float64, radius float64) []Point {
 	m := len(kdtree.BoundingBox)
 	if len(center) != m {
 		log.Fatalln("Dims of center does not match dims of kd-tree")
@@ -228,7 +241,7 @@ func (kdtree *KDTree) FindNeighbors(center []float64, radius float64) []Point {
 	return result
 }
 
-func (kdleaf *KDLeaf) findNeighbors(center []float64, radius float64) []Point {
+func (kdleaf KDLeaf) findNeighbors(center []float64, radius float64) []Point {
 	m := len(kdleaf.BoundingBox)
 	if len(center) != m {
 		log.Fatalln("Dims of center does not match dims of kd-leaf")
@@ -249,4 +262,35 @@ func (kdleaf *KDLeaf) findNeighbors(center []float64, radius float64) []Point {
 	}
 
 	return result
+}
+
+func (kdtree KDTree) FindAllNeighbors(radius float64) [][]Point {
+	result := make([][]Point, kdtree.NumPoints)
+	kdtree.findAllNeighborsTo(result, radius, kdtree)
+	return result
+}
+
+func (kdtree KDTree) findAllNeighborsTo(neighbors [][]Point, radius float64,
+	root KDTree) {
+	var waitGroup sync.WaitGroup
+	if kdtree.RSubTree != nil {
+		waitGroup.Add(1)
+		go func(wg *sync.WaitGroup) {
+			kdtree.RSubTree.findAllNeighborsTo(neighbors, radius, root)
+			wg.Done()
+		}(&waitGroup)
+	} else if kdtree.RLeaf != nil {
+		for _, point := range kdtree.RLeaf.Points {
+			neighbors[point.ID] = root.FindNeighbors(point.Vec, radius)
+		}
+	}
+
+	if kdtree.LSubTree != nil {
+		kdtree.LSubTree.findAllNeighborsTo(neighbors, radius, root)
+	} else if kdtree.LLeaf != nil {
+		for _, point := range kdtree.LLeaf.Points {
+			neighbors[point.ID] = root.FindNeighbors(point.Vec, radius)
+		}
+	}
+	waitGroup.Wait()
 }
