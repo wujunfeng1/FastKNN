@@ -1,10 +1,14 @@
 package FastNeighbors
 
 import (
+	"fmt"
 	"log"
 	"math"
+	"runtime"
 	"sort"
 	"sync"
+
+	"gonum.org/v1/gonum/mat"
 )
 
 type Interval struct {
@@ -211,6 +215,268 @@ func computeDistanceToPoint(center []float64, point []float64) float64 {
 	return result
 }
 
+func (kdtree KDTree) ComputeDensity(center []float64, radius float64) int {
+	m := len(kdtree.BoundingBox)
+	if len(center) != m {
+		log.Fatalln("Dims of center does not match dims of kd-tree")
+	}
+
+	result := 0
+	distance := computeDistanceToBoundingBox(center, kdtree.BoundingBox)
+	if distance > radius {
+		return result
+	}
+
+	if kdtree.LSubTree != nil {
+		childrenResult := kdtree.LSubTree.ComputeDensity(center, radius)
+		result += childrenResult
+	} else if kdtree.LLeaf != nil {
+		childrenResult := kdtree.LLeaf.computeDensity(center, radius)
+		result += childrenResult
+	}
+	if kdtree.RSubTree != nil {
+		childrenResult := kdtree.RSubTree.ComputeDensity(center, radius)
+		result += childrenResult
+	} else if kdtree.RLeaf != nil {
+		childrenResult := kdtree.RLeaf.computeDensity(center, radius)
+		result += childrenResult
+	}
+
+	return result
+}
+
+func (kdleaf KDLeaf) computeDensity(center []float64, radius float64) int {
+	m := len(kdleaf.BoundingBox)
+	if len(center) != m {
+		log.Fatalln("Dims of center does not match dims of kd-leaf")
+	}
+
+	result := 0
+	distance := computeDistanceToBoundingBox(center, kdleaf.BoundingBox)
+	if distance > radius {
+		return result
+	}
+
+	n := len(kdleaf.Points)
+	for j := 0; j < n; j++ {
+		distance = computeDistanceToPoint(center, kdleaf.Points[j].Vec)
+		if distance <= radius {
+			result++
+		}
+	}
+
+	return result
+}
+
+func (kdtree KDTree) getPointsTo(points []Point) {
+	if kdtree.LSubTree != nil {
+		kdtree.LSubTree.getPointsTo(points)
+	} else if kdtree.LLeaf != nil {
+		for _, point := range kdtree.LLeaf.Points {
+			points[point.ID] = point
+		}
+	}
+
+	if kdtree.RSubTree != nil {
+		kdtree.RSubTree.getPointsTo(points)
+	} else if kdtree.RLeaf != nil {
+		for _, point := range kdtree.RLeaf.Points {
+			points[point.ID] = point
+		}
+	}
+}
+
+func (kdtree KDTree) GetLeafClusters() [][]int {
+	result := [][]int{}
+	if kdtree.LSubTree != nil {
+		result = kdtree.LSubTree.GetLeafClusters()
+	} else if kdtree.LLeaf != nil {
+		cluster := make([]int, len(kdtree.LLeaf.Points))
+		for i, point := range kdtree.LLeaf.Points {
+			cluster[i] = point.ID
+		}
+		result = [][]int{cluster}
+	}
+
+	if kdtree.RSubTree != nil {
+		result = append(result, kdtree.RSubTree.GetLeafClusters()...)
+	} else if kdtree.RLeaf != nil {
+		cluster := make([]int, len(kdtree.RLeaf.Points))
+		for i, point := range kdtree.RLeaf.Points {
+			cluster[i] = point.ID
+		}
+		result = append(result, cluster)
+	}
+
+	return result
+}
+
+func (kdleaf KDLeaf) testDensityPeak(center []float64, radius float64, idxCenter int,
+	densities []int) bool {
+	m := len(kdleaf.BoundingBox)
+	if len(center) != m {
+		log.Fatalln("Dims of center does not match dims of kd-leaf")
+	}
+
+	distance := computeDistanceToBoundingBox(center, kdleaf.BoundingBox)
+	if distance > radius {
+		return true
+	}
+
+	n := len(kdleaf.Points)
+	for j := 0; j < n; j++ {
+		distance = computeDistanceToPoint(center, kdleaf.Points[j].Vec)
+		if distance <= radius {
+			if densities[kdleaf.Points[j].ID] > densities[idxCenter] {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func (kdtree KDTree) testDensityPeak(center []float64, radius float64, idxCenter int,
+	densities []int) bool {
+	m := len(kdtree.BoundingBox)
+	if len(center) != m {
+		log.Fatalln("Dims of center does not match dims of kd-tree")
+	}
+
+	distance := computeDistanceToBoundingBox(center, kdtree.BoundingBox)
+	if distance > radius {
+		return true
+	}
+
+	if kdtree.LSubTree != nil {
+		if !kdtree.LSubTree.testDensityPeak(center, radius, idxCenter, densities) {
+			return false
+		}
+	} else if kdtree.LLeaf != nil {
+		if !kdtree.LLeaf.testDensityPeak(center, radius, idxCenter, densities) {
+			return false
+		}
+	}
+	if kdtree.RSubTree != nil {
+		if !kdtree.RSubTree.testDensityPeak(center, radius, idxCenter, densities) {
+			return false
+		}
+	} else if kdtree.RLeaf != nil {
+		if !kdtree.RLeaf.testDensityPeak(center, radius, idxCenter, densities) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (kdtree KDTree) FindDensityPeaks(radius float64) []int {
+	points := make([]Point, kdtree.NumPoints)
+	densities := make([]int, kdtree.NumPoints)
+	isDensityPeak := make([]bool, kdtree.NumPoints)
+	kdtree.getPointsTo(points)
+
+	numCPUs := runtime.NumCPU()
+	var wg sync.WaitGroup
+	wg.Add(numCPUs)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func(idxCPU int) {
+			i0 := idxCPU * kdtree.NumPoints / numCPUs
+			i1 := (idxCPU + 1) * kdtree.NumPoints / numCPUs
+			for i := i0; i < i1; i++ {
+				densities[i] = kdtree.ComputeDensity(points[i].Vec, radius)
+			}
+			wg.Done()
+		}(idxCPU)
+	}
+	wg.Wait()
+
+	wg.Add(numCPUs)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func(idxCPU int) {
+			i0 := idxCPU * kdtree.NumPoints / numCPUs
+			i1 := (idxCPU + 1) * kdtree.NumPoints / numCPUs
+			for i := i0; i < i1; i++ {
+				isDensityPeak[i] = kdtree.testDensityPeak(points[i].Vec, radius, i, densities)
+			}
+			wg.Done()
+		}(idxCPU)
+	}
+	wg.Wait()
+
+	numDensityPeaks := 0
+	for i := 0; i < kdtree.NumPoints; i++ {
+		if isDensityPeak[i] {
+			numDensityPeaks++
+		}
+	}
+	result := make([]int, numDensityPeaks)
+	idxPeak := 0
+	for i := 0; i < kdtree.NumPoints; i++ {
+		if isDensityPeak[i] {
+			result[idxPeak] = i
+			idxPeak++
+		}
+	}
+	return result
+}
+
+func (kdtree KDTree) FindAdaptiveDensityPeaks(scale float64) []int {
+	points := make([]Point, kdtree.NumPoints)
+	densities := make([]int, kdtree.NumPoints)
+	isDensityPeak := make([]bool, kdtree.NumPoints)
+	kdtree.getPointsTo(points)
+
+	ar := NewAdaptiveRadius(kdtree.getLeafInfo())
+
+	numCPUs := runtime.NumCPU()
+	var wg sync.WaitGroup
+	wg.Add(numCPUs)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func(idxCPU int) {
+			i0 := idxCPU * kdtree.NumPoints / numCPUs
+			i1 := (idxCPU + 1) * kdtree.NumPoints / numCPUs
+			for i := i0; i < i1; i++ {
+				radius := math.Min(ar.RadiusAt(points[i].Vec)*scale, 1.0)
+				densities[i] = kdtree.ComputeDensity(points[i].Vec, radius)
+				//fmt.Printf("%d, %d: radius = %f, density = %d\n", idxCPU, i, radius, densities[i])
+			}
+			wg.Done()
+		}(idxCPU)
+	}
+	wg.Wait()
+
+	wg.Add(numCPUs)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func(idxCPU int) {
+			i0 := idxCPU * kdtree.NumPoints / numCPUs
+			i1 := (idxCPU + 1) * kdtree.NumPoints / numCPUs
+			for i := i0; i < i1; i++ {
+				radius := ar.RadiusAt(points[i].Vec) * scale
+				isDensityPeak[i] = kdtree.testDensityPeak(points[i].Vec, radius, i, densities)
+			}
+			wg.Done()
+		}(idxCPU)
+	}
+	wg.Wait()
+
+	numDensityPeaks := 0
+	for i := 0; i < kdtree.NumPoints; i++ {
+		if isDensityPeak[i] {
+			numDensityPeaks++
+		}
+	}
+	result := make([]int, numDensityPeaks)
+	idxPeak := 0
+	for i := 0; i < kdtree.NumPoints; i++ {
+		if isDensityPeak[i] {
+			result[idxPeak] = i
+			idxPeak++
+		}
+	}
+	return result
+}
+
 func (kdtree KDTree) FindNeighbors(center []float64, radius float64) []Point {
 	m := len(kdtree.BoundingBox)
 	if len(center) != m {
@@ -293,4 +559,135 @@ func (kdtree KDTree) findAllNeighborsTo(neighbors [][]Point, radius float64,
 		}
 	}
 	waitGroup.Wait()
+}
+
+type CircularRegion struct {
+	Center []float64
+	Radius float64
+}
+
+func (kdleaf KDLeaf) getLeafInfo() CircularRegion {
+	numDims := len(kdleaf.BoundingBox)
+	center := make([]float64, numDims)
+	for i := 0; i < numDims; i++ {
+		center[i] = 0.0
+	}
+	for _, point := range kdleaf.Points {
+		for i := 0; i < numDims; i++ {
+			center[i] += point.Vec[i]
+		}
+	}
+	numPoints := float64(len(kdleaf.Points))
+	if numPoints > 0.0 {
+		w := 1.0 / numPoints
+		for i := 0; i < numDims; i++ {
+			center[i] *= w
+		}
+	}
+	radius := 0.0
+	for _, point := range kdleaf.Points {
+		myRadius := 0.0
+		for i := 0; i < numDims; i++ {
+			d := center[i] - point.Vec[i]
+			myRadius += d * d
+		}
+		myRadius = math.Sqrt(myRadius)
+		if myRadius > radius {
+			radius = myRadius
+		}
+	}
+
+	return CircularRegion{Center: center, Radius: radius}
+}
+
+func (kdtree KDTree) getLeafInfo() []CircularRegion {
+	result := []CircularRegion{}
+	if kdtree.LSubTree != nil {
+		result = kdtree.LSubTree.getLeafInfo()
+	} else if kdtree.LLeaf != nil {
+		result = []CircularRegion{kdtree.LLeaf.getLeafInfo()}
+	}
+	if kdtree.RSubTree != nil {
+		result = append(result, kdtree.RSubTree.getLeafInfo()...)
+	} else if kdtree.RLeaf != nil {
+		result = append(result, kdtree.RLeaf.getLeafInfo())
+	}
+	return result
+}
+
+type AdaptiveRadius struct {
+	Regions  []CircularRegion
+	RBFCoefs []float64
+	RBFVar   float64
+}
+
+func NewAdaptiveRadius(regions []CircularRegion) AdaptiveRadius {
+	sumRadius := 0.0
+	numRegions := len(regions)
+	for _, region := range regions {
+		sumRadius += region.Radius
+	}
+	meanRadius := sumRadius / float64(numRegions)
+	rbfVar := meanRadius
+
+	numDims := len(regions[0].Center)
+	A := mat.NewDense(numRegions, numRegions, nil)
+	b := mat.NewVecDense(numRegions, nil)
+	x := mat.NewVecDense(numRegions, nil)
+	w := 0.5 / (rbfVar * rbfVar)
+	for i := 0; i < numRegions; i++ {
+		b.SetVec(i, regions[i].Radius)
+		for j := i; j < numRegions; j++ {
+			cdIJ := 0.0
+			for k := 0; k < numDims; k++ {
+				d := regions[i].Center[k] - regions[j].Center[k]
+				cdIJ += d * d
+			}
+			wij := math.Exp(-cdIJ * w)
+			A.Set(i, j, wij)
+			if i != j {
+				A.Set(j, i, wij)
+			}
+		}
+	}
+
+	var qr mat.QR
+	qr.Factorize(A)
+
+	err := qr.SolveVecTo(x, false, b)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	coefs := make([]float64, numRegions)
+	for i := 0; i < numRegions; i++ {
+		coefs[i] = x.AtVec(i)
+	}
+
+	return AdaptiveRadius{Regions: regions, RBFCoefs: coefs, RBFVar: rbfVar}
+}
+
+func (ar AdaptiveRadius) RadiusAt(center []float64) float64 {
+	numDims := len(ar.Regions[0].Center)
+	if len(center) != numDims {
+		err := fmt.Sprintf(
+			"Atempting to get adaptive radius of %d-dimensions at center of %d-dimensions",
+			numDims, len(center))
+		log.Fatalln(err)
+	}
+
+	result := 0.0
+	numRegions := len(ar.Regions)
+	w := 0.5 / (ar.RBFVar * ar.RBFVar)
+	for i := 0; i < numRegions; i++ {
+		cdI := 0.0
+		for k := 0; k < numDims; k++ {
+			d := ar.Regions[i].Center[k] - center[k]
+			cdI += d * d
+		}
+		wi := math.Exp(-cdI * w)
+		result += wi * ar.RBFCoefs[i]
+	}
+
+	return result
 }
