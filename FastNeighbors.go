@@ -62,7 +62,7 @@ func newKDLeaf(points []Point) *KDLeaf {
 	}
 }
 
-func NewKDTree(pointLocations [][]float64, numPointsPerLeaf int) *KDTree {
+func NewKDTree(pointLocations [][]float64, numPointsPerLeaf int, relaxation float64) *KDTree {
 	// get dims of data
 	n := len(pointLocations)
 	if n == 0 {
@@ -92,10 +92,16 @@ func NewKDTree(pointLocations [][]float64, numPointsPerLeaf int) *KDTree {
 	}
 
 	// return a KD tree containing these points
-	return createKDTree(points, numPointsPerLeaf)
+	return createKDTree(points, numPointsPerLeaf, relaxation)
 }
 
-func createKDTree(points []Point, numPointsPerLeaf int) *KDTree {
+// relaxation == 0.0 means no relaxation, all splits will be exactly half
+// relaxation == 1.0 means full relaxation, any split will be allowed.
+func createKDTree(points []Point, numPointsPerLeaf int, relaxation float64) *KDTree {
+	if relaxation < 0.0 || relaxation > 1.0 {
+		log.Fatalln("relaxation should be within [0.0,1.0]")
+	}
+
 	// create a KD tree with all these points in one leaf
 	result := &KDTree{
 		BoundingBox: computeBoundingBox(points),
@@ -108,13 +114,13 @@ func createKDTree(points []Point, numPointsPerLeaf int) *KDTree {
 	}
 
 	// split it to satisfy the numPointsPerLeaf condition
-	result.split(numPointsPerLeaf)
+	result.split(numPointsPerLeaf, relaxation)
 
 	// retur the result
 	return result
 }
 
-func (kdtree *KDTree) split(numPointsPerLeaf int) {
+func (kdtree *KDTree) split(numPointsPerLeaf int, relaxation float64) {
 	if kdtree.DivisionDim != -1 {
 		log.Fatalln("a KDTree is not allowed to split twice")
 	}
@@ -154,13 +160,59 @@ func (kdtree *KDTree) split(numPointsPerLeaf int) {
 		}
 	}
 
-	// split along dim with the largest variance
+	// sort along dim with the largest variance
 	kdtree.DivisionDim = dimWithMaxVar
 	sort.Slice(points, func(i, j int) bool {
 		return points[i].Vec[dimWithMaxVar] < points[j].Vec[dimWithMaxVar]
 	})
-	leftPoints := points[0 : n/2]
-	rightPoints := points[n/2 : n]
+
+	// compute the density along the dim
+	// reflect elements at boundary
+	densities := make([]float64, n)
+	densities[0] = 0.5 / (1e-10 + points[1].Vec[dimWithMaxVar] - points[0].Vec[dimWithMaxVar])
+	densities[n-1] = 0.5 / (1e-10 + points[n-1].Vec[dimWithMaxVar] - points[n-2].Vec[dimWithMaxVar])
+	for i := 1; i < n-1; i++ {
+		densities[i] = 1.0 / (1e-10 + points[i+1].Vec[dimWithMaxVar] - points[i-1].Vec[dimWithMaxVar])
+	}
+	prevDensities := densities
+	densities = make([]float64, n)
+	for iter := 0; iter < 3; iter++ {
+		densities[0] = 0.5 * (prevDensities[0] + prevDensities[1])
+		densities[n-1] = 0.5 * (prevDensities[n-2] + prevDensities[n-1])
+		for i := 1; i < n-1; i++ {
+			densities[i] = 0.25*(prevDensities[i-1]+prevDensities[i+1]) +
+				0.5*prevDensities[i]
+		}
+		prevDensities, densities = densities, prevDensities
+	}
+	highestDensity := 0.0
+	for i := 0; i < n; i++ {
+		if densities[i] > highestDensity {
+			highestDensity = densities[i]
+		}
+	}
+
+	// determine the range of valid split
+	leftmostSplit := int(math.Floor(0.5 * (1.0 - relaxation) * float64(n)))
+	rightmostSplit := n - leftmostSplit
+	if rightmostSplit < leftmostSplit {
+		rightmostSplit = leftmostSplit
+	} else if rightmostSplit >= n {
+		rightmostSplit = n - 1
+	}
+
+	// scan through the range to find the best split
+	bestSplit := n / 2
+	splitDensity := highestDensity
+	for i := leftmostSplit; i <= rightmostSplit; i++ {
+		if densities[i] < splitDensity {
+			bestSplit = i
+			splitDensity = densities[i]
+		}
+	}
+
+	leftPoints := points[0:bestSplit]
+	rightPoints := points[bestSplit:n]
 	kdtree.LLeaf = nil
 
 	// for each part, split it if it is still too large
@@ -168,7 +220,7 @@ func (kdtree *KDTree) split(numPointsPerLeaf int) {
 	waitGroup.Add(1)
 	go func(wg *sync.WaitGroup) {
 		if len(rightPoints) > numPointsPerLeaf {
-			kdtree.RSubTree = createKDTree(rightPoints, numPointsPerLeaf)
+			kdtree.RSubTree = createKDTree(rightPoints, numPointsPerLeaf, relaxation)
 		} else {
 			kdtree.RLeaf = newKDLeaf(rightPoints)
 		}
@@ -176,11 +228,25 @@ func (kdtree *KDTree) split(numPointsPerLeaf int) {
 	}(&waitGroup)
 
 	if len(leftPoints) > numPointsPerLeaf {
-		kdtree.LSubTree = createKDTree(leftPoints, numPointsPerLeaf)
+		kdtree.LSubTree = createKDTree(leftPoints, numPointsPerLeaf, relaxation)
 	} else {
 		kdtree.LLeaf = newKDLeaf(leftPoints)
 	}
 	waitGroup.Wait()
+}
+
+func (kdtree KDTree) ForEachLeaf(f func(leaf *KDLeaf)) {
+	if kdtree.LLeaf != nil {
+		f(kdtree.LLeaf)
+	} else if kdtree.LSubTree != nil {
+		kdtree.LSubTree.ForEachLeaf(f)
+	}
+
+	if kdtree.RLeaf != nil {
+		f(kdtree.RLeaf)
+	} else if kdtree.RSubTree != nil {
+		kdtree.RSubTree.ForEachLeaf(f)
+	}
 }
 
 func findNearestPointInBoundingBox(center []float64, boundingBox []Interval,
